@@ -148,7 +148,7 @@ let test_subtyping () =
 let () =
   test_record ();
   test_projection ();
-  test_subtyping ()
+  test_subtyping ();
 
 
 (*
@@ -375,3 +375,163 @@ let test_lambda_subtyping () =
 let () =
   test_lambda ();
   test_lambda_subtyping ();
+
+(*
+************************************************************
+ANF tranformation
+************************************************************
+*)
+
+type aexp =
+  | AVar   of string
+  | ATrue
+  | AFalse
+  | AZero
+  | ALam   of string * tp * anf       (* lambda with explicit name for the parameter *)
+  | ARecord of (string * aexp) list
+  | AProj  of aexp * string
+  | ASucc  of aexp
+  | AIszero of aexp
+  | APred  of aexp
+  | AApp   of aexp * aexp             (* application of atomic expressions *)
+  | AITE   of aexp * anf * anf        (* if-then-else, with branches in ANF *)
+
+and anf =
+  | Ans of aexp
+  | Let of string * aexp * anf
+
+let counter = ref 0
+let fresh () =
+  let n = !counter in
+  counter := n + 1;
+  "v" ^ string_of_int n
+
+  (* anf_cps : string list -> tm -> (aexp -> anf) -> anf
+   - env: a list mapping de Bruijn indices to names (with index 0 at the head)
+   - t: the source term (using de Bruijn indices)
+   - k: a continuation that expects an atomic expression (of type aexp)
+*)
+let rec anf_cps env t k =
+  match t with
+  | Var n ->
+      k (AVar (List.nth env n))
+  | True ->
+      k ATrue
+  | False ->
+      k AFalse
+  | Zero ->
+      k AZero
+  | Lam (ann, body) ->
+      let x = fresh () in
+      let env' = x :: env in
+      let body_anf = anf_cps env' body (fun a -> Ans a) in
+      k (ALam (x, ann, body_anf))
+  | App (t1, t2) ->
+      anf_cps env t1 (fun a1 ->
+      anf_cps env t2 (fun a2 ->
+         let x = fresh () in
+         Let (x, AApp (a1, a2), k (AVar x))
+      ))
+  | ITE (t1, t2, t3) ->
+      anf_cps env t1 (fun a1 ->
+         let x = fresh () in
+         Let (x, AITE (a1,
+                       anf_cps env t2 (fun a -> Ans a),
+                       anf_cps env t3 (fun a -> Ans a)),
+              k (AVar x))
+      )
+  | Succ t' ->
+      anf_cps env t' (fun a ->
+         let x = fresh () in
+         Let (x, ASucc a, k (AVar x))
+      )
+  | Iszero t' ->
+      anf_cps env t' (fun a ->
+         let x = fresh () in
+         Let (x, AIszero a, k (AVar x))
+      )
+  | Pred t' ->
+      anf_cps env t' (fun a ->
+         let x = fresh () in
+         Let (x, APred a, k (AVar x))
+      )
+  | Record fields ->
+      let rec process fields acc =
+        match fields with
+        | [] ->
+            let x = fresh () in
+            Let (x, ARecord (List.rev acc), k (AVar x))
+        | (lbl, t_field)::rest ->
+            anf_cps env t_field (fun a ->
+              process rest ((lbl, a) :: acc)
+            )
+      in
+      process fields []
+  | Proj (t', lbl) ->
+      anf_cps env t' (fun a ->
+         let x = fresh () in
+         Let (x, AProj (a, lbl), k (AVar x))
+      )
+
+(* Top-level conversion: start with an empty environment *)
+let anf_of_tm t = anf_cps [] t (fun a -> Ans a)
+
+(*
+************************************************************
+Testing
+************************************************************
+*)
+
+(* type printer *)
+let rec string_of_tp t =
+  match t with
+  | TNat -> "Nat"
+  | TFloat -> "Float"
+  | TBool -> "Bool"
+  | TTop -> "Top"
+  | TFun (t1, t2) -> "(" ^ string_of_tp t1 ^ " -> " ^ string_of_tp t2 ^ ")"
+  | TRec fields ->
+      let fields_str =
+        List.map (fun (lbl, tp) -> lbl ^ ": " ^ string_of_tp tp) fields
+      in
+      "{" ^ String.concat "; " fields_str ^ "}"
+
+(* ANF printer definitions *)
+let rec string_of_aexp a =
+  match a with
+  | AVar x -> x
+  | ATrue -> "true"
+  | AFalse -> "false"
+  | AZero -> "0"
+  | ALam (x, ann, body) ->
+      "λ" ^ x ^ ":" ^ string_of_tp ann ^ ". (" ^ string_of_anf body ^ ")"
+  | ARecord fields ->
+      let field_strs =
+        List.map (fun (lbl, a) -> lbl ^ " = " ^ string_of_aexp a) fields
+      in
+      "{" ^ String.concat "; " field_strs ^ "}"
+  | AProj (a, lbl) -> "(" ^ string_of_aexp a ^ ")." ^ lbl
+  | ASucc a -> "succ (" ^ string_of_aexp a ^ ")"
+  | AIszero a -> "iszero (" ^ string_of_aexp a ^ ")"
+  | APred a -> "pred (" ^ string_of_aexp a ^ ")"
+  | AApp (a1, a2) ->
+      "(" ^ string_of_aexp a1 ^ " " ^ string_of_aexp a2 ^ ")"
+  | AITE (a, t_then, t_else) ->
+      "if " ^ string_of_aexp a ^ " then " ^ string_of_anf t_then
+      ^ " else " ^ string_of_anf t_else
+
+and string_of_anf e =
+  match e with
+  | Ans a -> string_of_aexp a
+  | Let (x, a, body) ->
+      "let " ^ x ^ " = " ^ string_of_aexp a ^ " in " ^ string_of_anf body
+
+(* Test for the ANF conversion *)
+let test_anf () =
+  (* (λ x:Nat. succ x) 0 *)
+  let term = App (Lam (TNat, Succ (Var 0)), Zero) in
+  let anf_term = anf_of_tm term in
+  Printf.printf "ANF conversion of (λx:Nat. succ x) 0:\n%s\n" (string_of_anf anf_term)
+
+(* Run the test *)
+let () = test_anf ()

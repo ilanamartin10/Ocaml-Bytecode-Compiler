@@ -1,16 +1,3 @@
-
-(*
- ************************************************************
- 1. Implementing the small-step semantics
- ************************************************************
- *)
-
-(*
- ************************************************************
- 1.1. name-based syntax
- ************************************************************
- *)
-
  type tp =
  | TNat
  | TFloat
@@ -38,44 +25,6 @@ let rec subtype t1 t2 =
        fields2
  | _ -> false
 
- (* 
-
-let const : named_tm = NLam ("x", NLam ("y", NVar "x"))
-let omega : named_tm = NLam ("x", NApp (NVar "x", NVar "x"))
-let ycomb : named_tm =
- NLam
-   ("f",
-    NApp
-      (omega,
-       NLam
-         ("x",
-          NApp
-            (NVar "f",
-             NLam ("y", NApp (NApp (NVar "x", NVar "x"), NVar "y"))))))
-let add   : named_tm =
- NApp
-   (ycomb,
-    NLam
-      ("add",
-       NLam
-         ("x",
-          NLam
-            ("y",
-             NITE
-               (NIszero (NVar "x"),
-                NVar "y",
-                NSucc (NApp (NApp (NVar "add", NPred (NVar "x")), NVar "y")))))))
-let sum   : named_tm =
- NApp
-   (ycomb,
-    NLam
-      ("sum",
-       NLam
-         ("n",
-          NITE
-            (NIszero (NVar "n"),
-             NZero,
-             NApp (NApp (add, NVar "n"), NApp (NVar "sum", NPred (NVar "n"))))))) *)
 
 type tm =
  (* x *)
@@ -200,12 +149,13 @@ let () =
   test_record ();
   test_projection ();
   test_subtyping ()
-         
-(* (*
-************************************************************
-1.3. debruijnify
-************************************************************
-*)
+
+
+(*
+ ************************************************************
+debruijnify
+ ************************************************************
+ *)
 
 type name = string
 type ctx = name list
@@ -214,174 +164,214 @@ exception IllScoped
 
 (* a helper function to get the debruijn index of named variable *)
 let lookup s =
- let rec helper n =
-   function
-   | []                     -> raise IllScoped
-   | s' :: _    when s = s' -> n
-   | _  :: ctx'             -> helper (n + 1) ctx'
- in
- helper 0
+  let rec helper n =
+    function
+    | []                     -> raise IllScoped
+    | s' :: _    when s = s' -> n
+    | _  :: ctx'             -> helper (n + 1) ctx'
+  in
+  helper 0
 
-let rec debruijnify (ctx : ctx) =
- function
- | NVar s            -> Var (lookup s ctx)
- | NLam (s, t)       -> Lam (debruijnify (s :: ctx) t)
- | NApp (t1, t2)     -> App (debruijnify ctx t1, debruijnify ctx t2)
- | NTrue             -> True
- | NFalse            -> False
- | NITE (t1, t2, t3) -> ITE (debruijnify ctx t1, debruijnify ctx t2, debruijnify ctx t3)
- | NZero             -> Zero
- | NSucc t           -> Succ (debruijnify ctx t)
- | NIszero t         -> Iszero (debruijnify ctx t)
- | NPred t           -> Pred (debruijnify ctx t)
+(*
+ ************************************************************
+shift
+ ************************************************************
+ *)
+ let rec shift c d t =
+  match t with
+  | Var n when n >= c -> Var (n + d)
+  | Var _ | True | False | Zero -> t
+  | Lam (ann, body) -> Lam (ann, shift (c+1) d body)
+  | App (t1, t2) -> App (shift c d t1, shift c d t2)
+  | ITE (t1, t2, t3) -> ITE (shift c d t1, shift c d t2, shift c d t3)
+  | Succ t1 -> Succ (shift c d t1)
+  | Iszero t1 -> Iszero (shift c d t1)
+  | Pred t1 -> Pred (shift c d t1)
+  | Record fields ->
+      Record (List.map (fun (label, term) -> (label, shift c d term)) fields)
+  | Proj (t1, label) -> Proj (shift c d t1, label)
 
 (*
 ************************************************************
-1.4. shift
+substitution
 ************************************************************
 *)
-
-let rec shift c d =
- function
- | Var n when n >= c                  -> Var (n + d)
- | (Var _ | True | False | Zero) as t -> t
- | Lam t                              -> Lam (shift (c + 1) d t)
- | App (t1, t2)                       -> App (shift c d t1, shift c d t2)
- | ITE (t1, t2, t3)                   -> ITE (shift c d t1, shift c d t2, shift c d t3)
- | Succ t                             -> Succ (shift c d t)
- | Iszero t                           -> Iszero (shift c d t)
- | Pred t                             -> Pred (shift c d t)
+let rec subst s j t =
+  match t with
+  | Var n when n = j -> s
+  | Var _ | True | False | Zero -> t
+  | Lam (ann, body) -> Lam (ann, subst (shift 0 1 s) (j+1) body)
+  | App (t1, t2) -> App (subst s j t1, subst s j t2)
+  | ITE (t1, t2, t3) -> ITE (subst s j t1, subst s j t2, subst s j t3)
+  | Succ t1 -> Succ (subst s j t1)
+  | Iszero t1 -> Iszero (subst s j t1)
+  | Pred t1 -> Pred (subst s j t1)
+  | Record fields ->
+      Record (List.map (fun (label, term) -> (label, subst s j term)) fields)
+  | Proj (t1, label) -> Proj (subst s j t1, label)
 
 (*
 ************************************************************
-1.5. Substitution
+small-step semantics
 ************************************************************
 *)
-
-let rec subst s j =
- function
- | Var n when n = j                   -> s
- | (Var _ | True | False | Zero) as t -> t
- | Lam t                              -> Lam (subst (shift 0 1 s) (j + 1) t)
- | App (t1, t2)                       -> App (subst s j t1, subst s j t2)
- | ITE (t1, t2, t3)                   -> ITE (subst s j t1, subst s j t2, subst s j t3)
- | Succ t                             -> Succ (subst s j t)
- | Iszero t                           -> Iszero (subst s j t)
- | Pred t                             -> Pred (subst s j t)
-
-(*
-************************************************************
-1.6. Step
-************************************************************
-*)
-
 type progress = IsValue | Step of tm
 
 exception Stuck
 
-let rec step =
- function
- | Var n -> raise IllScoped
- | Lam _ | True | False | Zero -> IsValue
- | App (t1, t2) ->
-    begin
-      match step t1 with
-      | Step t1' -> Step (App (t1', t2))
-      | IsValue  ->
-         match t1, step t2 with
-         | _,       Step t2' -> Step (App (t1, t2'))
-         | Lam t1', IsValue  -> Step (shift 0 (-1) (subst (shift 0 1 t2) 0 t1'))
-         | _                 -> raise Stuck
-    end
- | ITE (t1, t2, t3) ->
-    begin
-      match t1, step t1 with
-      | _,     Step t1' -> Step (ITE (t1', t2, t3))
-      | True,  IsValue  -> Step t2
-      | False, IsValue  -> Step t3
-      | _               -> raise Stuck
-    end
- | Succ t ->
-    begin
-      match step t with
-      | Step t' -> Step (Succ t')
-      | IsValue -> IsValue
-    end
- | Iszero t ->
-    begin
-      match t, step t with
-      | _,      Step t' -> Step (Succ t')
-      | Zero,   IsValue -> Step True
-      | Succ _, IsValue -> Step False
-      | _               -> raise Stuck
-    end
- | Pred t ->
-    begin
-      match t, step t with
-      | _,       Step t' -> Step (Succ t')
-      | Zero,    IsValue -> Step Zero
-      | Succ t', IsValue -> Step t'
-      | _                -> raise Stuck
-    end
+let rec step t =
+  match t with
+  | Var n -> raise IllScoped
+  | Lam _ | True | False | Zero -> IsValue
+  | App (t1, t2) ->
+      begin
+        match step t1 with
+        | Step t1' -> Step (App (t1', t2))
+        | IsValue  ->
+            (match t1, step t2 with
+             | _, Step t2' -> Step (App (t1, t2'))
+             | Lam (_, body), IsValue -> Step (shift 0 (-1) (subst (shift 0 1 t2) 0 body))
+             | _ -> raise Stuck)
+      end
+  | ITE (t1, t2, t3) ->
+      begin
+        match t1, step t1 with
+        | _, Step t1' -> Step (ITE (t1', t2, t3))
+        | True, IsValue -> Step t2
+        | False, IsValue -> Step t3
+        | _ -> raise Stuck
+      end
+  | Succ t1 ->
+      begin
+        match step t1 with
+        | Step t' -> Step (Succ t')
+        | IsValue -> IsValue
+      end
+  | Iszero t1 ->
+      begin
+        match t1, step t1 with
+        | _, Step t' -> Step (Iszero t')
+        | Zero, IsValue -> Step True
+        | Succ _, IsValue -> Step False
+        | _ -> raise Stuck
+      end
+  | Pred t1 ->
+      begin
+        match t1, step t1 with
+        | _, Step t' -> Step (Pred t')
+        | Zero, IsValue -> Step Zero
+        | Succ t', IsValue -> Step t'
+        | _ -> raise Stuck
+      end
+  | Record fields ->
+      (* Evaluate record fields left-to-right *)
+      let rec step_fields acc = function
+        | [] -> IsValue
+        | (label, term)::rest ->
+            (match step term with
+             | Step term' -> Step (Record (List.rev acc @ ((label, term')::rest)))
+             | IsValue -> step_fields ((label, term)::acc) rest)
+      in step_fields [] fields
+  | Proj (t1, label) ->
+      begin
+        match step t1 with
+        | Step t1' -> Step (Proj (t1', label))
+        | IsValue ->
+            (match t1 with
+             | Record fields ->
+                 (match List.assoc_opt label fields with
+                  | Some v -> Step v
+                  | None -> raise Stuck)
+             | _ -> raise Stuck)
+      end
 
 (*
 ************************************************************
-1.7. Eval
+Eval
 ************************************************************
 *)
-
-let rec eval t =
- match step t with
- | Step t' -> eval t'
- | IsValue -> t
+let rec big_eval t =
+  match t with
+  | Var n -> raise IllScoped
+  | Lam _ | True | False | Zero -> t
+  | App (t1, t2) ->
+      begin
+        match big_eval t1 with
+        | Lam (_, body) ->
+            let arg = shift 0 1 (big_eval t2) in
+            big_eval (shift 0 (-1) (subst arg 0 body))
+        | _ -> raise Stuck
+      end
+  | ITE (t1, t2, t3) ->
+      begin
+        match big_eval t1 with
+        | True  -> big_eval t2
+        | False -> big_eval t3
+        | _     -> raise Stuck
+      end
+  | Succ t1 -> Succ (big_eval t1)
+  | Iszero t1 ->
+      begin
+        match big_eval t1 with
+        | Zero   -> True
+        | Succ _ -> False
+        | _      -> raise Stuck
+      end
+  | Pred t1 ->
+      begin
+        match big_eval t1 with
+        | Zero   -> Zero
+        | Succ v -> v
+        | _      -> raise Stuck
+      end
+  | Record fields ->
+      let eval_fields = List.map (fun (l, t) -> (l, big_eval t)) fields in
+      Record eval_fields
+  | Proj (t1, label) ->
+      let t1' = big_eval t1 in
+      (match t1' with
+       | Record fields ->
+           (match List.assoc_opt label fields with
+            | Some v -> v
+            | None -> raise Stuck)
+       | _ -> raise Stuck)
 
 (*
 ************************************************************
-1.8. Fifteen
+Testing 
 ************************************************************
 *)
 
-let five = NSucc (NSucc (NSucc (NSucc (NSucc NZero))))
+(* lambda evaluation *)
+let test_lambda () =
+  (* (λ x:TNat. Succ x) 0 *)
+  let term = App (Lam (TNat, Succ (Var 0)), Zero) in
+  let result = big_eval term in
+  match result with
+  | Succ Zero -> Printf.printf "Lambda test succeeded: (λx. Succ x) 0 evaluated to Succ 0\n"
+  | _ -> Printf.printf "Lambda test failed\n"
 
-let fifteen = eval (debruijnify [] (NApp (sum, five)))
 
-(*
-************************************************************
-2. Implementing the big-step semantics
-************************************************************
-*)
+(* lambda with record subtyping *)
+let test_lambda_subtyping () =
+  (* lambda that expects a record with a single field "x" of type TNat, and returns the "x" field.*)
+  let lam = Lam (TRec [("x", TNat)], Proj (Var 0, "x")) in
 
-let rec big_eval =
- function
- | Var n -> raise IllScoped
- | (Lam _ | True | False | Zero) as t -> t
- | App (t1, t2) ->
-    begin
-      match big_eval t1 with
-      | Lam t1' ->
-         let arg = shift 0 1 (big_eval t2) in
-         big_eval (shift 0 (-1) (subst arg 0 t1'))
-      | _ -> raise Stuck
-    end
- | ITE (t1, t2, t3) ->
-    begin
-      match big_eval t1 with
-      | True  -> big_eval t2
-      | False -> big_eval t3
-      | _     -> raise Stuck
-    end
- | Succ t -> Succ (big_eval t)
- | Iszero t ->
-    begin
-      match big_eval t with
-      | Zero   -> True
-      | Succ _ -> False
-      | _      -> raise Stuck
-    end
- | Pred t ->
-    begin
-      match big_eval t with
-      | Zero   -> Zero
-      | Succ v -> v
-      | _      -> raise Stuck
-    end *)
+  (* record with two fields:
+         "x" with value Zero and "y" with value True.
+          Its type is TRec [("x", TNat); ("y", TBool)].
+     By width subtyping, this record is a subtype of TRec [("x", TNat)].
+  *)
+  let arg = Record [("x", Zero); ("y", True)] in
+
+  let app = App (lam, arg) in
+  let t = typeof [] app in
+  match t with
+  | TNat ->
+      Printf.printf "Lambda subtyping test succeeded: application typed as TNat\n"
+  | _ ->
+      Printf.printf "Lambda subtyping test failed: unexpected type\n"
+
+let () =
+  test_lambda ();
+  test_lambda_subtyping ();

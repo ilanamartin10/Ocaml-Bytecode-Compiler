@@ -562,7 +562,7 @@ type instr =
   | GET_FIELD of string           (* extracts a field value from a record *)
 and code = instr list
 
-(* Environment: mapping variable names to stack slot numbers *)
+(* variable names --> stack slot numbers *)
 type env = (string * int) list
 
 (* Fresh Label Generator  *)
@@ -584,8 +584,6 @@ let rec compile_aexp (env : env) (a : aexp) : code =
   | AZero ->
       [PUSH_INT 0]
   | ALam (x, ann, body) ->
-      (* When compiling a lambda, we assume that its body runs in a fresh environment.
-         The parameter x is bound to slot 0; all free variables in the closure are shifted. *)
       let env' = (x, 0) :: (List.map (fun (v, i) -> (v, i + 1)) env) in
       let body_code = compile_anf body env' 1 in
       [PUSH_CLOSURE (body_code @ [RETURN])]
@@ -632,8 +630,13 @@ and compile_anf (prog : anf) (env : env) (next_slot : int) : code =
       let code_body = compile_anf body env' (next_slot + 1) in
       code_a @ code_store @ code_body
 
+(*
+************************************************************
+Test
+************************************************************
+*)
 
-(* ========= Bytecode Instruction Printer ========= *)
+(* pretty print *)
 let string_of_instr instr =
   match instr with
   | PUSH_INT n -> "PUSH_INT " ^ string_of_int n
@@ -655,12 +658,6 @@ let string_of_instr instr =
 
 let string_of_code code =
   String.concat "\n" (List.map string_of_instr code)
-
-(*
-************************************************************
-Test
-************************************************************
-*)
 
 (* Lambda evaluation - Compile (λx:Nat. succ x) 0 *)
 let test_lambda_anf =
@@ -689,3 +686,237 @@ let test_bytecode_record_projection () =
 let () =
   test_bytecode_lambda ();
   test_bytecode_record_projection ();
+
+(*
+************************************************************
+VM
+************************************************************
+*)
+
+(* runtime value types*)
+type value =
+  | VInt of int
+  | VBool of bool
+  | VClosure of code * rt_env  (* its code and the captured runtime environment *)
+  | VRecord of (string * value) list
+
+and rt_env = (int * value) list
+
+(* machine state *)
+type machine_state = {
+  mutable code : code;
+  mutable ip : int;
+  mutable stack : value list;
+  mutable env : rt_env;              (* slot numbers --> values *)
+  mutable call_stack : (int * rt_env * code) list;  (* saved (ip, env, code) for CALL/RETURN *)
+  label_table : (int, int) Hashtbl.t; (* label numbers --> code indices *)
+}
+let rec lookup_env env slot =
+  match env with
+  | [] -> failwith ("Slot " ^ string_of_int slot ^ " not found")
+  | (i, v) :: rest -> if i = slot then v else lookup_env rest slot
+
+let update_env env slot v =
+  let rec aux env =
+    match env with
+    | [] -> [(slot, v)]
+    | (i, w) :: rest ->
+        if i = slot then (i, v) :: rest
+        else (i, w) :: aux rest
+  in
+  aux env
+
+let rec run_vm state =
+  if state.ip >= List.length state.code then
+    (match state.stack with
+     | v :: _ -> v
+     | [] -> failwith "Empty stack at end of execution")
+  else
+    let instr = List.nth state.code state.ip in
+    state.ip <- state.ip + 1;
+    (match instr with
+     | PUSH_INT n ->
+         state.stack <- (VInt n) :: state.stack;
+         run_vm state
+
+     | PUSH_BOOL b ->
+         state.stack <- (VBool b) :: state.stack;
+         run_vm state
+
+     | PUSH_VAR i ->
+         let v = lookup_env state.env i in
+         state.stack <- v :: state.stack;
+         run_vm state
+
+     | PUSH_CLOSURE c ->
+         state.stack <- (VClosure (c, state.env)) :: state.stack;
+         run_vm state
+
+     | CALL ->
+         let arg = pop state in
+         let clos = pop state in
+         (match clos with
+          | VClosure (c, clo_env) ->
+              state.call_stack <- (state.ip, state.env, state.code) :: state.call_stack;
+              state.env <- (0, arg) :: (List.map (fun (v, i) -> (v, i)) clo_env);
+              state.code <- c;
+              state.ip <- 0;
+              run_vm state
+          | _ -> failwith "CALL: Expected closure")
+
+     | RETURN ->
+         let ret_val = pop state in
+         (match state.call_stack with
+          | [] -> ret_val
+          | (saved_ip, saved_env, saved_code) :: rest ->
+              state.call_stack <- rest;
+              state.ip <- saved_ip;
+              state.env <- saved_env;
+              state.code <- saved_code;
+              state.stack <- ret_val :: state.stack;
+              run_vm state)
+
+     | SUCC ->
+         let v = pop state in
+         (match v with
+          | VInt n -> state.stack <- (VInt (n + 1)) :: state.stack; run_vm state
+          | _ -> failwith "SUCC: Expected integer")
+
+     | ISZERO ->
+         let v = pop state in
+         (match v with
+          | VInt n -> state.stack <- (VBool (n = 0)) :: state.stack; run_vm state
+          | _ -> failwith "ISZERO: Expected integer")
+
+     | PRED ->
+         let v = pop state in
+         (match v with
+          | VInt n -> state.stack <- (VInt (n - 1)) :: state.stack; run_vm state
+          | _ -> failwith "PRED: Expected integer")
+
+     | STORE slot ->
+         let v = pop state in
+         state.env <- update_env state.env slot v;
+         run_vm state
+
+     | POP ->
+         let _ = pop state in run_vm state
+
+     | JMP_IF_FALSE label ->
+         let v = pop state in
+         (match v with
+          | VBool false ->
+              (try
+                 state.ip <- Hashtbl.find state.label_table label;
+                 run_vm state
+               with Not_found -> failwith ("JMP_IF_FALSE: Label " ^ string_of_int label ^ " not found"))
+          | _ ->
+              run_vm state)
+
+     | JMP label ->
+         (try
+            state.ip <- Hashtbl.find state.label_table label;
+            run_vm state
+          with Not_found -> failwith ("JMP: Label " ^ string_of_int label ^ " not found"))
+
+     | LABEL _ ->
+         run_vm state
+
+    | BUILD_RECORD fields ->
+          let rec pop_n n =
+            if n <= 0 then [] else pop_n (n - 1) @ [pop state]
+          in
+          let values = pop_n (List.length fields) in
+          let rec combine names values =
+            match names, values with
+            | [], [] -> []
+            | name :: rest_names, v :: rest_values -> (name, v) :: combine rest_names rest_values
+            | _ -> failwith "BUILD_RECORD: Mismatched field count"
+          in
+          let record = VRecord (combine fields values) in
+          state.stack <- record :: state.stack;
+          run_vm state
+    
+     | GET_FIELD field ->
+         let v = pop state in
+         (match v with
+          | VRecord fields ->
+              (try
+                 let field_val = List.assoc field fields in
+                 state.stack <- field_val :: state.stack;
+                 run_vm state
+               with Not_found -> failwith ("GET_FIELD: Field " ^ field ^ " not found"))
+          | _ -> failwith "GET_FIELD: Expected record"))
+
+and pop state =
+  match state.stack with
+  | [] -> failwith "Stack underflow"
+  | v :: rest ->
+      state.stack <- rest;
+      v
+
+let build_label_table code =
+  let tbl = Hashtbl.create 10 in
+  List.iteri (fun idx instr ->
+    match instr with
+    | LABEL l -> Hashtbl.add tbl l idx
+    | _ -> ()
+  ) code;
+  tbl
+
+let initial_state code =
+  { code = code;
+    ip = 0;
+    stack = [];
+    env = []; 
+    call_stack = [];
+    label_table = build_label_table code }
+
+(*
+************************************************************
+Testing
+************************************************************
+*)
+
+(* pretty print *)
+let string_of_value v =
+  match v with
+  | VInt n -> string_of_int n
+  | VBool b -> string_of_bool b
+  | VClosure _ -> "<closure>"
+  | VRecord fields ->
+      let fields_str = String.concat ", " (List.map (fun (k, v) ->
+        match v with
+        | VInt n -> k ^ " = " ^ string_of_int n
+        | VBool b -> k ^ " = " ^ string_of_bool b
+        | _ -> k ^ " = <complex>"
+      ) fields)
+      in "{ " ^ fields_str ^ " }"
+
+let initial_state code =
+  { code = code;
+    ip = 0;
+    stack = [];
+    env = [];
+    call_stack = [];
+    label_table = build_label_table code }
+
+(* lamda *)
+let test_bytecode_lambda () =
+  let bytecode = compile_anf test_lambda_anf [] 0 in
+  Printf.printf "Bytecode for (λx:Nat. succ x) 0:\n%s\n\n" (string_of_code bytecode);
+  let state = initial_state bytecode in
+  let result = run_vm state in
+  Printf.printf "VM result for lambda test: %s\n\n" (string_of_value result)
+
+(* record projection *)
+let test_bytecode_record_projection () =
+  let bytecode = compile_anf test_record_projection_anf [] 0 in
+  Printf.printf "Bytecode for record projection ({x = 0; y = true}).x:\n%s\n\n" (string_of_code bytecode);
+  let state = initial_state bytecode in
+  let result = run_vm state in
+  Printf.printf "VM result for record projection test: %s\n\n" (string_of_value result)
+
+let () =
+  test_bytecode_lambda ();
+  test_bytecode_record_projection ()
